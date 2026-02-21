@@ -111,11 +111,14 @@ def setup_scraper():
         state.scraper.set_cookies(session_id, token)
         if state.scraper._verify_login():
             return True, "Logged in with saved cookies"
+        # Cookies didn't actually work — clear the flag set_cookies() set
+        state.scraper.is_logged_in = False
 
     # Try auto-login
     if state.scraper.login():
         return True, "Auto-login successful"
 
+    state.scraper.is_logged_in = False
     return False, "Login failed - please set cookies"
 
 
@@ -969,8 +972,11 @@ def handle_cookies():
     else:
         state.scraper.set_cookies(session_id, token)
 
-    # Verify
-    if state.scraper._verify_login():
+    # Verify — and sync is_logged_in to the actual result
+    verified = state.scraper._verify_login()
+    state.scraper.is_logged_in = verified
+
+    if verified:
         return jsonify({'success': True, 'message': 'Cookies saved and verified!'})
     else:
         return jsonify({'success': False, 'message': 'Cookies saved but verification failed'})
