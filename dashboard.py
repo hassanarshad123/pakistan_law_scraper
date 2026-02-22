@@ -10,6 +10,7 @@ Open: http://localhost:5000
 
 import os
 import json
+import logging
 import threading
 import time
 from datetime import datetime
@@ -23,6 +24,7 @@ except ImportError:
     pass
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
 
 # Database layer — only active when DATABASE_URL is set
 _db = None
@@ -72,6 +74,12 @@ class ScraperState:
     index_year_start = None # None = 1947
     index_year_end = None   # None = 2026
 
+    # Auto-restart settings
+    auto_restart = True         # enabled by default
+    restart_count = 0           # times auto-restarted in current session
+    max_restarts = 5            # cap to prevent infinite restart loops
+    restart_delay = 30          # seconds to wait before auto-restart
+
     # Settings
     keywords = ['contract']
     year = '5'
@@ -101,36 +109,36 @@ def save_config(config):
 
 
 def setup_scraper():
-    """Initialize scraper with saved cookies"""
+    """Initialize scraper — auto-login first, saved cookies as fallback"""
     config = load_config()
+    username = config.get('username', os.environ.get('PLS_USERNAME', 'LHCBAR8'))
 
     state.scraper = PakistanLawScraper(
-        username=config.get('username', os.environ.get('PLS_USERNAME', 'LHCBAR8')),
+        username=username,
         password=config.get('password', os.environ.get('PLS_PASSWORD', 'pakbar8')),
         delay_range=(1.5, 3.0)
     )
 
-    # Try saved cookies
+    # Primary: auto-login with credentials
+    if state.scraper.login():
+        return True, f"Logged in as {username}"
+
+    # Fallback: saved cookies
     session_id = config.get('session_id', '')
     token = config.get('verification_token', '')
-
     if session_id and token:
         state.scraper.set_cookies(session_id, token)
         if state.scraper._verify_login():
             return True, "Logged in with saved cookies"
-        # Cookies didn't actually work — clear the flag set_cookies() set
         state.scraper.is_logged_in = False
 
-    # Try auto-login
-    if state.scraper.login():
-        return True, "Auto-login successful"
-
     state.scraper.is_logged_in = False
-    return False, "Login failed - please set cookies"
+    return False, "Auto-login failed - check credentials in .env"
 
 
 def scrape_worker():
     """Background scraping worker"""
+    crashed = False
     try:
         all_cases = []
 
@@ -167,22 +175,28 @@ def scrape_worker():
                     state.last_case_id = case_id
 
                     if state.get_details and case_id:
+                        best_details = {}
                         for _attempt in range(3):
                             try:
                                 details = state.scraper.get_case_details(case_id)
-                                case.update(details)
-                                break
+                                for k, v in details.items():
+                                    if v and (k not in best_details or not best_details[k]):
+                                        best_details[k] = v
+                                break  # Full success
                             except SessionExpiredError:
                                 state.errors.append(f"{case_id}: Session expired, re-authenticating...")
                                 if not state.scraper._try_reauth():
                                     state.errors.append(f"{case_id}: Re-auth failed")
                                     break
                             except EmptyContentError:
-                                state.errors.append(f"{case_id}: Empty content, attempt {_attempt+1}/3, backing off 5s...")
-                                time.sleep(5)
+                                backoff = 5 * (2 ** _attempt)
+                                state.errors.append(f"{case_id}: Empty content, attempt {_attempt+1}/3, backing off {backoff}s...")
+                                time.sleep(backoff)
                             except Exception as e:
                                 state.errors.append(f"{case_id}: {str(e)[:50]}")
                                 break
+                        if best_details:
+                            case.update(best_details)
 
                     case['scraped_at'] = datetime.now().isoformat()
                     case['search_keyword'] = keyword
@@ -206,12 +220,16 @@ def scrape_worker():
 
     except Exception as e:
         state.errors.append(f"Fatal: {str(e)}")
+        crashed = True
     finally:
         state.is_running = False
+        if crashed and not state.should_stop and state.auto_restart and state.restart_count < state.max_restarts:
+            _schedule_restart()
 
 
 def index_scrape_worker():
     """Background worker for index-based scraping"""
+    crashed = False
     try:
         def on_progress(progress_data):
             state.combos_completed = progress_data.get('completed_count', 0)
@@ -245,8 +263,43 @@ def index_scrape_worker():
 
     except Exception as e:
         state.errors.append(f"Fatal: {str(e)}")
+        crashed = True
     finally:
         state.is_running = False
+        if crashed and not state.should_stop and state.auto_restart and state.restart_count < state.max_restarts:
+            _schedule_restart()
+
+
+def _schedule_restart():
+    """Schedule an auto-restart after a delay."""
+    state.restart_count += 1
+    delay = state.restart_delay
+    logger.info(f"Auto-restart {state.restart_count}/{state.max_restarts} scheduled in {delay}s...")
+    state.errors.append(f"Auto-restart {state.restart_count}/{state.max_restarts} in {delay}s...")
+
+    def _do_restart():
+        if state.should_stop or state.is_running:
+            return  # User stopped or already restarted manually
+
+        # Re-authenticate if needed
+        if state.scraper and not state.scraper._verify_login():
+            if not state.scraper._try_reauth():
+                state.errors.append("Auto-restart failed: re-auth failed")
+                return
+
+        # Re-launch the worker
+        state.is_running = True
+        state.should_stop = False
+        if state.mode == 'index':
+            state.thread = threading.Thread(target=index_scrape_worker, daemon=True)
+        else:
+            state.thread = threading.Thread(target=scrape_worker, daemon=True)
+        state.thread.start()
+        logger.info(f"Auto-restart {state.restart_count}: scraper resumed")
+
+    timer = threading.Timer(delay, _do_restart)
+    timer.daemon = True
+    timer.start()
 
 
 # HTML Template
@@ -438,6 +491,7 @@ DASHBOARD_HTML = '''
                 <div class="status-details">
                     <div>Workers: <span id="detailWorkers">--</span></div>
                     <div>Cases (24h): <span id="detail24h">--</span></div>
+                    <div>Auto-restarts: <span id="detailRestarts">0/5</span></div>
                 </div>
             </div>
             <div class="card">
@@ -452,6 +506,7 @@ DASHBOARD_HTML = '''
                     <label>Workers</label>
                     <input type="number" id="indexWorkers" value="3" min="1" max="10">
                     <label><input type="checkbox" id="indexGetDetails" checked> Fetch details</label>
+                    <label><input type="checkbox" id="autoRestart" checked> Auto-restart</label>
                 </div>
                 <div id="fileInfo" style="margin-top: 8px; font-size: 12px; color: #64748b;"></div>
             </div>
@@ -485,21 +540,45 @@ DASHBOARD_HTML = '''
             <div class="card">
                 <div class="section-title">Authentication</div>
                 <div id="authStatus" style="margin-bottom: 10px; color: #64748b; font-size: 13px;">Checking...</div>
-                <div class="form-group">
-                    <label>Session ID</label>
-                    <input type="text" id="sessionId" placeholder="ASP.NET_SessionId">
-                </div>
-                <div class="form-group">
-                    <label>Verification Token</label>
-                    <input type="text" id="verificationToken" placeholder="__RequestVerificationToken">
-                </div>
-                <button class="btn-save" onclick="saveCookies()" style="width: 100%;">Save Cookies</button>
+                <button class="btn-save" onclick="relogin()" style="width: 100%; margin-bottom: 12px;">Re-login</button>
+                <details style="margin-top: 8px;">
+                    <summary style="cursor: pointer; color: #64748b; font-size: 12px;">Advanced: Manual Cookies</summary>
+                    <div style="margin-top: 10px;">
+                        <div class="form-group">
+                            <label>Session ID</label>
+                            <input type="text" id="sessionId" placeholder="ASP.NET_SessionId">
+                        </div>
+                        <div class="form-group">
+                            <label>Verification Token</label>
+                            <input type="text" id="verificationToken" placeholder="__RequestVerificationToken">
+                        </div>
+                        <button class="btn-save" onclick="saveCookies()" style="width: 100%;">Save Cookies</button>
+                    </div>
+                </details>
             </div>
             <div class="card">
                 <div class="section-title">Error Log</div>
                 <div class="error-log" id="errorLog">
                     <div class="no-errors">No errors</div>
                 </div>
+            </div>
+        </div>
+
+        <!-- Backfill Card -->
+        <div class="card" style="margin-bottom: 20px;">
+            <div class="section-title">Backfill Missing Descriptions</div>
+            <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                <button class="btn-start" id="btnBackfill" onclick="startBackfill()">Start Backfill</button>
+                <button class="btn-stop btn-disabled" id="btnBackfillStop" onclick="stopBackfill()" disabled>Stop</button>
+                <span id="backfillMsg" style="font-size: 13px; color: #94a3b8;"></span>
+            </div>
+            <div class="kpi-bar" style="height: 8px; margin-bottom: 8px;">
+                <div class="kpi-bar-fill" id="backfillBar" style="width: 0%; background: linear-gradient(90deg, #a855f7, #38bdf8);"></div>
+            </div>
+            <div style="font-size: 12px; color: #64748b;">
+                Processed: <span id="backfillProcessed" style="color: #f8fafc;">0</span> / <span id="backfillTotal" style="color: #f8fafc;">0</span>
+                &nbsp;&bull;&nbsp; Fixed: <span id="backfillFixed" style="color: #22c55e;">0</span>
+                &nbsp;&bull;&nbsp; Errors: <span id="backfillErrors" style="color: #f87171;">0</span>
             </div>
         </div>
     </div>
@@ -540,6 +619,8 @@ DASHBOARD_HTML = '''
             }
 
             document.getElementById('detailWorkers').textContent = d.num_workers || '--';
+            document.getElementById('detailRestarts').textContent = (d.restart_count || 0) + '/' + (d.max_restarts || 5);
+            document.getElementById('autoRestart').checked = d.auto_restart !== false;
 
             // DB connection banner
             const banner = document.getElementById('dbBanner');
@@ -734,7 +815,8 @@ DASHBOARD_HTML = '''
                 mode: 'index',
                 output_file: 'all_cases_index.csv',
                 get_details: document.getElementById('indexGetDetails').checked,
-                num_workers: parseInt(document.getElementById('indexWorkers').value) || 3
+                num_workers: parseInt(document.getElementById('indexWorkers').value) || 3,
+                auto_restart: document.getElementById('autoRestart').checked
             };
             try {
                 const r = await fetch('/api/start', {
@@ -784,6 +866,50 @@ DASHBOARD_HTML = '''
             } catch(e) { showToast('Failed to save cookies', true); }
         }
 
+        async function relogin() {
+            try {
+                const r = await fetch('/api/relogin', {method: 'POST'});
+                const d = await r.json();
+                showToast(d.message, !d.success);
+                fetchStatus();
+            } catch(e) { showToast('Re-login failed', true); }
+        }
+
+        async function startBackfill() {
+            try {
+                const r = await fetch('/api/backfill', {method: 'POST'});
+                const d = await r.json();
+                showToast(d.message, !d.success);
+            } catch(e) { showToast('Failed to start backfill', true); }
+        }
+
+        async function stopBackfill() {
+            try {
+                const r = await fetch('/api/backfill/stop', {method: 'POST'});
+                const d = await r.json();
+                showToast(d.message, !d.success);
+            } catch(e) { showToast('Failed to stop backfill', true); }
+        }
+
+        async function fetchBackfillStatus() {
+            try {
+                const r = await fetch('/api/backfill/status');
+                const d = await r.json();
+                document.getElementById('backfillProcessed').textContent = fmt(d.processed);
+                document.getElementById('backfillTotal').textContent = fmt(d.total);
+                document.getElementById('backfillFixed').textContent = fmt(d.fixed);
+                document.getElementById('backfillErrors').textContent = fmt(d.errors);
+                document.getElementById('backfillMsg').textContent = d.message || '';
+                const pct = d.total > 0 ? ((d.processed / d.total) * 100) : 0;
+                document.getElementById('backfillBar').style.width = pct + '%';
+
+                document.getElementById('btnBackfill').disabled = d.is_running;
+                document.getElementById('btnBackfill').className = d.is_running ? 'btn-start btn-disabled' : 'btn-start';
+                document.getElementById('btnBackfillStop').disabled = !d.is_running;
+                document.getElementById('btnBackfillStop').className = d.is_running ? 'btn-stop' : 'btn-stop btn-disabled';
+            } catch(e) {}
+        }
+
         async function loadSavedCookies() {
             try {
                 const r = await fetch('/api/cookies');
@@ -798,11 +924,13 @@ DASHBOARD_HTML = '''
         fetchStatus();
         fetchDashboardStats();
         fetchMatrix();
+        fetchBackfillStatus();
 
         // Polling intervals
         setInterval(fetchStatus, 2000);
         setInterval(fetchDashboardStats, 5000);
         setInterval(fetchMatrix, 10000);
+        setInterval(fetchBackfillStatus, 2000);
     </script>
 </body>
 </html>
@@ -834,7 +962,10 @@ def get_status():
 
     if state.scraper:
         authenticated = state.scraper.is_logged_in
-        auth_status = "Authenticated" if authenticated else "Not authenticated"
+        if authenticated:
+            auth_status = f"Logged in as {state.scraper.username}"
+        else:
+            auth_status = "Not authenticated"
     elif config.get('session_id'):
         auth_status = "Cookies saved (not verified)"
 
@@ -862,6 +993,9 @@ def get_status():
         'num_workers': state.num_workers,
         'db_connected': _db is not None,
         'db_error': _db_error,
+        'auto_restart': state.auto_restart,
+        'restart_count': state.restart_count,
+        'max_restarts': state.max_restarts,
     }
     return jsonify(result)
 
@@ -888,15 +1022,17 @@ def start_scraper():
         if not success:
             return jsonify({'success': False, 'message': msg})
 
-    # Verify authentication
+    # Verify authentication — try re-login before failing
     if not state.scraper._verify_login():
-        return jsonify({'success': False, 'message': 'Not authenticated - please save valid cookies'})
+        if not state.scraper._try_reauth():
+            return jsonify({'success': False, 'message': 'Auto-login failed. Click Re-login or check credentials.'})
 
     # Get settings from request
     data = request.json or {}
     state.mode = data.get('mode', 'keyword')
     state.output_file = data.get('output_file', 'scraped_cases.csv')
     state.get_details = data.get('get_details', True)
+    state.auto_restart = data.get('auto_restart', True)
 
     # Reset state
     state.should_stop = False
@@ -904,6 +1040,7 @@ def start_scraper():
     state.errors = []
     state.start_time = datetime.now()
     state.is_running = True
+    state.restart_count = 0
 
     if state.mode == 'index':
         # Index mode
@@ -1069,6 +1206,159 @@ def handle_cookies():
         return jsonify({'success': True, 'message': 'Cookies saved and verified!'})
     else:
         return jsonify({'success': False, 'message': 'Cookies saved but verification failed'})
+
+
+class BackfillState:
+    """State for the backfill worker"""
+    is_running = False
+    should_stop = False
+    thread = None
+    total = 0
+    processed = 0
+    fixed = 0
+    errors = 0
+    message = ""
+
+
+backfill_state = BackfillState()
+
+
+def backfill_worker():
+    """Background worker to re-scrape cases with missing descriptions"""
+    try:
+        if not _db:
+            backfill_state.message = "No database configured"
+            return
+
+        missing = _db.get_cases_missing_details(limit=500)
+        backfill_state.total = len(missing)
+        backfill_state.processed = 0
+        backfill_state.fixed = 0
+        backfill_state.errors = 0
+
+        if not missing:
+            backfill_state.message = "No cases with missing details found"
+            return
+
+        backfill_state.message = f"Backfilling {len(missing)} cases..."
+
+        for item in missing:
+            if backfill_state.should_stop:
+                backfill_state.message = "Backfill stopped by user"
+                break
+
+            case_id = item['case_id']
+            get_head = item['missing_head_notes']
+            get_desc = item['missing_description']
+
+            best_details = {}
+            for _attempt in range(3):
+                try:
+                    details = state.scraper.get_case_details(
+                        case_id,
+                        get_head_notes=get_head,
+                        get_full_description=get_desc
+                    )
+                    for k, v in details.items():
+                        if v and (k not in best_details or not best_details[k]):
+                            best_details[k] = v
+                    break  # Full success
+                except SessionExpiredError:
+                    if not state.scraper._try_reauth():
+                        break
+                except EmptyContentError:
+                    backoff = 5 * (2 ** _attempt)
+                    time.sleep(backoff)
+                except Exception:
+                    break
+
+            backfill_state.processed += 1
+
+            if best_details:
+                # Upsert to DB — insert_case uses ON CONFLICT to fill empty fields
+                case_data = {
+                    'case_id': case_id,
+                    'citation': '', 'year': '', 'journal': '', 'page': '',
+                    'court': '', 'parties_full': '', 'petitioner': '', 'respondent': '',
+                    'keywords': None, 'summary': None,
+                    'head_notes': best_details.get('head_notes'),
+                    'full_description': best_details.get('full_description'),
+                    'scraped_at': datetime.now().isoformat(),
+                    'source': 'backfill', 'search_journal': None,
+                    'search_year': None, 'search_keyword': None,
+                }
+                if _db.insert_case(case_data):
+                    backfill_state.fixed += 1
+                else:
+                    backfill_state.errors += 1
+            else:
+                backfill_state.errors += 1
+
+        backfill_state.message = f"Done: {backfill_state.fixed} fixed, {backfill_state.errors} errors out of {backfill_state.total}"
+
+    except Exception as e:
+        backfill_state.message = f"Backfill error: {e}"
+    finally:
+        backfill_state.is_running = False
+
+
+@app.route('/api/backfill', methods=['POST'])
+def start_backfill():
+    """Start the backfill worker to re-scrape cases with missing details"""
+    if backfill_state.is_running:
+        return jsonify({'success': False, 'message': 'Backfill already running'})
+    if state.is_running:
+        return jsonify({'success': False, 'message': 'Main scraper is running — stop it first'})
+    if not state.scraper or not state.scraper.is_logged_in:
+        success, msg = setup_scraper()
+        if not success:
+            return jsonify({'success': False, 'message': msg})
+    if not _db:
+        return jsonify({'success': False, 'message': 'No database configured'})
+
+    backfill_state.is_running = True
+    backfill_state.should_stop = False
+    backfill_state.total = 0
+    backfill_state.processed = 0
+    backfill_state.fixed = 0
+    backfill_state.errors = 0
+    backfill_state.message = "Starting..."
+    backfill_state.thread = threading.Thread(target=backfill_worker, daemon=True)
+    backfill_state.thread.start()
+    return jsonify({'success': True, 'message': 'Backfill started'})
+
+
+@app.route('/api/backfill/stop', methods=['POST'])
+def stop_backfill():
+    """Stop the backfill worker"""
+    if not backfill_state.is_running:
+        return jsonify({'success': False, 'message': 'Backfill not running'})
+    backfill_state.should_stop = True
+    return jsonify({'success': True, 'message': 'Stopping backfill...'})
+
+
+@app.route('/api/backfill/status')
+def backfill_status():
+    """Return backfill progress"""
+    return jsonify({
+        'is_running': backfill_state.is_running,
+        'total': backfill_state.total,
+        'processed': backfill_state.processed,
+        'fixed': backfill_state.fixed,
+        'errors': backfill_state.errors,
+        'message': backfill_state.message,
+    })
+
+
+@app.route('/api/relogin', methods=['POST'])
+def relogin():
+    """Force fresh auto-login with credentials"""
+    if not state.scraper:
+        success, msg = setup_scraper()
+        return jsonify({'success': success, 'message': msg})
+    if state.scraper.login():
+        return jsonify({'success': True, 'message': f'Logged in as {state.scraper.username}'})
+    return jsonify({'success': False, 'message': 'Login failed - check credentials'})
 
 
 if __name__ == '__main__':

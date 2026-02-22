@@ -382,6 +382,29 @@ def get_dashboard_stats():
         conn.close()
 
 
+def get_cases_missing_details(limit=500):
+    """Return case_ids with NULL/empty head_notes or full_description.
+
+    Returns list of dicts: [{'case_id': ..., 'missing_head_notes': bool, 'missing_description': bool}, ...]
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("""
+                SELECT case_id,
+                       (head_notes IS NULL OR head_notes = '')       AS missing_head_notes,
+                       (full_description IS NULL OR full_description = '') AS missing_description
+                FROM cases
+                WHERE (head_notes IS NULL OR head_notes = '')
+                   OR (full_description IS NULL OR full_description = '')
+                ORDER BY scraped_at DESC
+                LIMIT %s
+            """, (limit,))
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def reset_all():
     """Full reset: delete all rows from scrape_progress and cases tables."""
     conn = get_connection()

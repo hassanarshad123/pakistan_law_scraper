@@ -734,8 +734,13 @@ class PakistanLawScraper:
 
         Returns:
             Dictionary with head_notes and/or full_description
+
+        Raises:
+            SessionExpiredError: If session has expired (always re-raised immediately)
+            EmptyContentError: Only if ALL requested fields came back empty
         """
         details = {}
+        empty_fields = []
 
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -759,12 +764,15 @@ class PakistanLawScraper:
                     cleaned = self._clean_html_content(response.text)
                     if len(cleaned) < 10:
                         logger.warning(f"Empty/short head_notes for {case_id}")
-                        raise EmptyContentError(f"head_notes empty for {case_id}")
-                    details['head_notes'] = cleaned
+                        empty_fields.append('head_notes')
+                    else:
+                        details['head_notes'] = cleaned
                 else:
                     details['head_notes'] = ''
-            except (SessionExpiredError, EmptyContentError):
-                raise  # Let caller handle re-auth / retry
+            except SessionExpiredError:
+                raise  # Always let caller handle re-auth
+            except EmptyContentError:
+                empty_fields.append('head_notes')
             except Exception as e:
                 logger.warning(f"Failed to get head notes for {case_id}: {e}")
                 details['head_notes'] = ''
@@ -784,15 +792,27 @@ class PakistanLawScraper:
                     cleaned = self._clean_html_content(response.text)
                     if len(cleaned) < 10:
                         logger.warning(f"Empty/short full_description for {case_id}")
-                        raise EmptyContentError(f"full_description empty for {case_id}")
-                    details['full_description'] = cleaned
+                        empty_fields.append('full_description')
+                    else:
+                        details['full_description'] = cleaned
                 else:
                     details['full_description'] = ''
-            except (SessionExpiredError, EmptyContentError):
-                raise  # Let caller handle re-auth / retry
+            except SessionExpiredError:
+                raise  # Always let caller handle re-auth
+            except EmptyContentError:
+                empty_fields.append('full_description')
             except Exception as e:
                 logger.warning(f"Failed to get full description for {case_id}: {e}")
                 details['full_description'] = ''
+
+        # Only raise EmptyContentError if ALL requested fields are empty
+        requested = []
+        if get_head_notes:
+            requested.append('head_notes')
+        if get_full_description:
+            requested.append('full_description')
+        if requested and len(empty_fields) == len(requested):
+            raise EmptyContentError(f"All fields empty for {case_id}: {empty_fields}")
 
         return details
     
@@ -850,22 +870,28 @@ class PakistanLawScraper:
                     # Get detailed content if requested
                     if get_details and case_id:
                         logger.info(f"Fetching details for case: {case_id}")
+                        best_details = {}
                         for _attempt in range(3):
                             try:
                                 details = self.get_case_details(case_id)
-                                case.update(details)
-                                break
+                                for k, v in details.items():
+                                    if v and (k not in best_details or not best_details[k]):
+                                        best_details[k] = v
+                                break  # Full success
                             except SessionExpiredError:
                                 logger.warning(f"Session expired fetching details for {case_id}, re-authenticating...")
                                 if not self._try_reauth():
                                     logger.error(f"Re-auth failed, skipping details for {case_id}")
                                     break
                             except EmptyContentError:
-                                logger.warning(f"Empty content for {case_id}, attempt {_attempt+1}/3, backing off 5s...")
-                                time.sleep(5)
+                                backoff = 5 * (2 ** _attempt)
+                                logger.warning(f"Empty content for {case_id}, attempt {_attempt+1}/3, backing off {backoff}s...")
+                                time.sleep(backoff)
                             except Exception as e:
                                 logger.warning(f"Failed to get details for {case_id}: {e}")
                                 break
+                        if best_details:
+                            case.update(best_details)
                     
                     # Add metadata
                     case['scraped_at'] = datetime.now().isoformat()
@@ -1167,23 +1193,29 @@ class PakistanLawScraper:
 
                     # Fetch details if requested (with session-expiry retry)
                     if get_details:
+                        best_details = {}
                         for _attempt in range(3):
                             try:
                                 details = self.get_case_details(case_id)
-                                case.update(details)
+                                for k, v in details.items():
+                                    if v and (k not in best_details or not best_details[k]):
+                                        best_details[k] = v
                                 last_request_time = time.time()
-                                break
+                                break  # Full success
                             except SessionExpiredError:
                                 logger.warning(f"Session expired fetching details for {case_id}, re-authenticating...")
                                 if not self._try_reauth():
                                     logger.error(f"Re-auth failed, skipping details for {case_id}")
                                     break
                             except EmptyContentError:
-                                logger.warning(f"Empty content for {case_id}, attempt {_attempt+1}/3, backing off 5s...")
-                                time.sleep(5)
+                                backoff = 5 * (2 ** _attempt)
+                                logger.warning(f"Empty content for {case_id}, attempt {_attempt+1}/3, backing off {backoff}s...")
+                                time.sleep(backoff)
                             except Exception as e:
                                 logger.warning(f"Failed to get details for {case_id}: {e}")
                                 break
+                        if best_details:
+                            case.update(best_details)
 
                     case['scraped_at'] = datetime.now().isoformat()
                     case['source'] = 'index_search'
@@ -1381,23 +1413,29 @@ class PakistanLawScraper:
                         processed_ids.add(case_id)
 
                     if get_details:
+                        best_details = {}
                         for _attempt in range(3):
                             try:
                                 details = scraper.get_case_details(case_id)
-                                case.update(details)
+                                for k, v in details.items():
+                                    if v and (k not in best_details or not best_details[k]):
+                                        best_details[k] = v
                                 last_request_time = time.time()
-                                break
+                                break  # Full success
                             except SessionExpiredError:
                                 logger.warning(f"W{worker_id}: Session expired fetching details for {case_id}, re-authenticating...")
                                 if not scraper._try_reauth():
                                     logger.error(f"W{worker_id}: Re-auth failed, skipping details for {case_id}")
                                     break
                             except EmptyContentError:
-                                logger.warning(f"W{worker_id}: Empty content for {case_id}, attempt {_attempt+1}/3, backing off 5s...")
-                                time.sleep(5)
+                                backoff = 5 * (2 ** _attempt)
+                                logger.warning(f"W{worker_id}: Empty content for {case_id}, attempt {_attempt+1}/3, backing off {backoff}s...")
+                                time.sleep(backoff)
                             except Exception as e:
                                 logger.warning(f"W{worker_id}: Details failed for {case_id}: {e}")
                                 break
+                        if best_details:
+                            case.update(best_details)
 
                     case['scraped_at'] = datetime.now().isoformat()
                     case['source'] = 'index_search'
