@@ -14,7 +14,7 @@ import threading
 import time
 from datetime import datetime
 from flask import Flask, render_template_string, jsonify, request, send_file
-from scraper import PakistanLawScraper, SessionExpiredError
+from scraper import PakistanLawScraper, SessionExpiredError, EmptyContentError
 
 try:
     from dotenv import load_dotenv
@@ -107,7 +107,7 @@ def setup_scraper():
     state.scraper = PakistanLawScraper(
         username=config.get('username', os.environ.get('PLS_USERNAME', 'LHCBAR8')),
         password=config.get('password', os.environ.get('PLS_PASSWORD', 'pakbar8')),
-        delay_range=(0.2, 0.5)
+        delay_range=(1.5, 3.0)
     )
 
     # Try saved cookies
@@ -177,6 +177,9 @@ def scrape_worker():
                                 if not state.scraper._try_reauth():
                                     state.errors.append(f"{case_id}: Re-auth failed")
                                     break
+                            except EmptyContentError:
+                                state.errors.append(f"{case_id}: Empty content, attempt {_attempt+1}/3, backing off 5s...")
+                                time.sleep(5)
                             except Exception as e:
                                 state.errors.append(f"{case_id}: {str(e)[:50]}")
                                 break
@@ -266,7 +269,7 @@ DASHBOARD_HTML = '''
         .section-title { font-size: 13px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
 
         /* KPI Cards Row */
-        .kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+        .kpi-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
         .kpi-card {
             background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155;
             text-align: center;
@@ -369,7 +372,7 @@ DASHBOARD_HTML = '''
         .toast.error { background: #ef4444; }
 
         @media (max-width: 768px) {
-            .kpi-row { grid-template-columns: repeat(2, 1fr); }
+            .kpi-row { grid-template-columns: repeat(2, 1fr) !important; }
             .two-col { grid-template-columns: 1fr; }
         }
     </style>
@@ -402,6 +405,18 @@ DASHBOARD_HTML = '''
                 <div class="kpi-value" id="kpiCompletion">--%</div>
                 <div class="kpi-label">Completion</div>
                 <div class="kpi-sub" id="kpiCompletionSub">headnotes present</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-value" id="kpiWithDesc">--</div>
+                <div class="kpi-label">With Description</div>
+                <div class="kpi-bar"><div class="kpi-bar-fill" id="kpiWithDescBar" style="width:0%"></div></div>
+                <div class="kpi-sub" id="kpiWithDescSub"></div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-value" id="kpiNoHead">--</div>
+                <div class="kpi-label">Without Headnotes</div>
+                <div class="kpi-bar"><div class="kpi-bar-fill" id="kpiNoHeadBar" style="width:0%;background:linear-gradient(90deg,#ef4444,#f97316);"></div></div>
+                <div class="kpi-sub" id="kpiNoHeadSub"></div>
             </div>
             <div class="kpi-card">
                 <div class="kpi-value" id="kpiCombos">--</div>
@@ -546,6 +561,12 @@ DASHBOARD_HTML = '''
                 document.getElementById('kpiCompletion').textContent = '--%';
                 document.getElementById('kpiCompletionSub').textContent = d.db_connected === false ? 'needs DB' : '';
 
+                document.getElementById('kpiWithDesc').textContent = '--';
+                document.getElementById('kpiWithDescSub').textContent = d.db_connected === false ? 'needs DB' : '';
+
+                document.getElementById('kpiNoHead').textContent = '--';
+                document.getElementById('kpiNoHeadSub').textContent = d.db_connected === false ? 'needs DB' : '';
+
                 if (d.combos_total > 0) {
                     document.getElementById('kpiCombos').textContent = fmt(d.combos_completed) + ' / ' + fmt(d.combos_total);
                     const comboPct = (d.combos_completed / d.combos_total) * 100;
@@ -606,6 +627,19 @@ DASHBOARD_HTML = '''
             const comp = s.total_cases > 0 ? ((s.cases_with_headnotes / s.total_cases) * 100).toFixed(1) : 0;
             document.getElementById('kpiCompletion').textContent = comp + '%';
             document.getElementById('kpiCompletionSub').textContent = fmt(s.cases_with_headnotes) + ' / ' + fmt(s.total_cases) + ' with headnotes';
+
+            // With Description card
+            const descPct = s.total_cases > 0 ? ((s.cases_with_description / s.total_cases) * 100).toFixed(1) : 0;
+            document.getElementById('kpiWithDesc').textContent = descPct + '%';
+            document.getElementById('kpiWithDescBar').style.width = descPct + '%';
+            document.getElementById('kpiWithDescSub').textContent = fmt(s.cases_with_description) + ' / ' + fmt(s.total_cases) + ' with description';
+
+            // Without Headnotes card
+            const noHead = s.total_cases - (s.cases_with_headnotes || 0);
+            const noHeadPct = s.total_cases > 0 ? ((noHead / s.total_cases) * 100).toFixed(1) : 0;
+            document.getElementById('kpiNoHead').textContent = fmt(noHead);
+            document.getElementById('kpiNoHeadBar').style.width = noHeadPct + '%';
+            document.getElementById('kpiNoHeadSub').textContent = noHeadPct + '% missing headnotes';
 
             document.getElementById('kpiCombos').textContent = fmt(s.combos_completed) + ' / ' + fmt(s.combos_total);
             const comboPct = s.combos_total > 0 ? ((s.combos_completed / s.combos_total) * 100) : 0;

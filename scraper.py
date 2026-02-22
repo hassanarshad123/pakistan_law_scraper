@@ -43,6 +43,11 @@ class SessionExpiredError(Exception):
     pass
 
 
+class EmptyContentError(Exception):
+    """Raised when server returns HTTP 200 but content is empty/too short"""
+    pass
+
+
 class PakistanLawScraper:
     """Scraper for Pakistan Law Site"""
     
@@ -751,11 +756,15 @@ class PakistanLawScraper:
                 self._check_rate_limit(response)
                 self._check_case_response(response, case_id, 'head_notes')
                 if response.ok:
-                    details['head_notes'] = self._clean_html_content(response.text)
+                    cleaned = self._clean_html_content(response.text)
+                    if len(cleaned) < 10:
+                        logger.warning(f"Empty/short head_notes for {case_id}")
+                        raise EmptyContentError(f"head_notes empty for {case_id}")
+                    details['head_notes'] = cleaned
                 else:
                     details['head_notes'] = ''
-            except SessionExpiredError:
-                raise  # Let caller handle re-auth
+            except (SessionExpiredError, EmptyContentError):
+                raise  # Let caller handle re-auth / retry
             except Exception as e:
                 logger.warning(f"Failed to get head notes for {case_id}: {e}")
                 details['head_notes'] = ''
@@ -772,11 +781,15 @@ class PakistanLawScraper:
                 self._check_rate_limit(response)
                 self._check_case_response(response, case_id, 'full_description')
                 if response.ok:
-                    details['full_description'] = self._clean_html_content(response.text)
+                    cleaned = self._clean_html_content(response.text)
+                    if len(cleaned) < 10:
+                        logger.warning(f"Empty/short full_description for {case_id}")
+                        raise EmptyContentError(f"full_description empty for {case_id}")
+                    details['full_description'] = cleaned
                 else:
                     details['full_description'] = ''
-            except SessionExpiredError:
-                raise  # Let caller handle re-auth
+            except (SessionExpiredError, EmptyContentError):
+                raise  # Let caller handle re-auth / retry
             except Exception as e:
                 logger.warning(f"Failed to get full description for {case_id}: {e}")
                 details['full_description'] = ''
@@ -847,6 +860,9 @@ class PakistanLawScraper:
                                 if not self._try_reauth():
                                     logger.error(f"Re-auth failed, skipping details for {case_id}")
                                     break
+                            except EmptyContentError:
+                                logger.warning(f"Empty content for {case_id}, attempt {_attempt+1}/3, backing off 5s...")
+                                time.sleep(5)
                             except Exception as e:
                                 logger.warning(f"Failed to get details for {case_id}: {e}")
                                 break
@@ -1162,6 +1178,9 @@ class PakistanLawScraper:
                                 if not self._try_reauth():
                                     logger.error(f"Re-auth failed, skipping details for {case_id}")
                                     break
+                            except EmptyContentError:
+                                logger.warning(f"Empty content for {case_id}, attempt {_attempt+1}/3, backing off 5s...")
+                                time.sleep(5)
                             except Exception as e:
                                 logger.warning(f"Failed to get details for {case_id}: {e}")
                                 break
@@ -1373,6 +1392,9 @@ class PakistanLawScraper:
                                 if not scraper._try_reauth():
                                     logger.error(f"W{worker_id}: Re-auth failed, skipping details for {case_id}")
                                     break
+                            except EmptyContentError:
+                                logger.warning(f"W{worker_id}: Empty content for {case_id}, attempt {_attempt+1}/3, backing off 5s...")
+                                time.sleep(5)
                             except Exception as e:
                                 logger.warning(f"W{worker_id}: Details failed for {case_id}: {e}")
                                 break

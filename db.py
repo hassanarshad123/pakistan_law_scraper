@@ -101,7 +101,15 @@ def insert_case(case_dict):
                         %(parties_full)s, %(petitioner)s, %(respondent)s,
                         %(keywords)s, %(summary)s, %(head_notes)s, %(full_description)s,
                         %(scraped_at)s, %(source)s, %(search_journal)s, %(search_year)s, %(search_keyword)s
-                    ) ON CONFLICT (case_id) DO NOTHING
+                    ) ON CONFLICT (case_id) DO UPDATE SET
+                        head_notes = CASE
+                            WHEN (cases.head_notes IS NULL OR cases.head_notes = '')
+                                 AND EXCLUDED.head_notes IS NOT NULL AND EXCLUDED.head_notes != ''
+                            THEN EXCLUDED.head_notes ELSE cases.head_notes END,
+                        full_description = CASE
+                            WHEN (cases.full_description IS NULL OR cases.full_description = '')
+                                 AND EXCLUDED.full_description IS NOT NULL AND EXCLUDED.full_description != ''
+                            THEN EXCLUDED.full_description ELSE cases.full_description END
                 """, _normalize_case(case_dict))
             conn.commit()
             return True
@@ -149,7 +157,15 @@ def insert_cases_batch(cases_list):
                         %(parties_full)s, %(petitioner)s, %(respondent)s,
                         %(keywords)s, %(summary)s, %(head_notes)s, %(full_description)s,
                         %(scraped_at)s, %(source)s, %(search_journal)s, %(search_year)s, %(search_keyword)s
-                    ) ON CONFLICT (case_id) DO NOTHING
+                    ) ON CONFLICT (case_id) DO UPDATE SET
+                        head_notes = CASE
+                            WHEN (cases.head_notes IS NULL OR cases.head_notes = '')
+                                 AND EXCLUDED.head_notes IS NOT NULL AND EXCLUDED.head_notes != ''
+                            THEN EXCLUDED.head_notes ELSE cases.head_notes END,
+                        full_description = CASE
+                            WHEN (cases.full_description IS NULL OR cases.full_description = '')
+                                 AND EXCLUDED.full_description IS NOT NULL AND EXCLUDED.full_description != ''
+                            THEN EXCLUDED.full_description ELSE cases.full_description END
                 """, _normalize_case(case))
         conn.commit()
         logger.info(f"Batch inserted {len(cases_list)} cases")
