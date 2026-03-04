@@ -7,7 +7,9 @@ All functions are synchronous. Falls back gracefully when DATABASE_URL is not se
 """
 
 import os
+import time
 import logging
+import functools
 from datetime import datetime
 
 import psycopg2
@@ -22,7 +24,20 @@ def get_connection():
     """Return a new psycopg2 connection using DATABASE_URL."""
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL environment variable is not set")
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+
+
+def _retry_on_disconnect(fn):
+    """Decorator: retry a DB function once on transient connection errors (SSL EOF, closed connection, etc.)."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            logger.warning(f"{fn.__name__} failed with transient DB error: {e}, retrying in 2s...")
+            time.sleep(2)
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def init_tables():
@@ -215,6 +230,7 @@ def _normalize_case(case):
     }
 
 
+@_retry_on_disconnect
 def get_processed_ids():
     """Return a set of all case_ids in the database (for dedup)."""
     conn = get_connection()
@@ -226,6 +242,7 @@ def get_processed_ids():
         conn.close()
 
 
+@_retry_on_disconnect
 def get_progress():
     """
     Return progress as the same nested dict shape as index_progress.json:
@@ -276,6 +293,7 @@ def get_progress():
         conn.close()
 
 
+@_retry_on_disconnect
 def update_progress(journal, year, status, cases_found=0, error_message=None):
     """UPSERT one journal+year progress row."""
     conn = get_connection()
@@ -295,6 +313,7 @@ def update_progress(journal, year, status, cases_found=0, error_message=None):
         conn.close()
 
 
+@_retry_on_disconnect
 def get_case_count():
     """Return total number of cases in the database."""
     conn = get_connection()
@@ -306,6 +325,7 @@ def get_case_count():
         conn.close()
 
 
+@_retry_on_disconnect
 def get_dashboard_stats():
     """Return KPI stats for the dashboard in a single DB round-trip.
 
@@ -382,6 +402,7 @@ def get_dashboard_stats():
         conn.close()
 
 
+@_retry_on_disconnect
 def get_cases_missing_details(limit=500):
     """Return case_ids with NULL/empty head_notes or full_description.
 
@@ -405,6 +426,7 @@ def get_cases_missing_details(limit=500):
         conn.close()
 
 
+@_retry_on_disconnect
 def reset_all():
     """Full reset: delete all rows from scrape_progress and cases tables."""
     conn = get_connection()
@@ -418,6 +440,7 @@ def reset_all():
         conn.close()
 
 
+@_retry_on_disconnect
 def reset_in_progress():
     """Crash recovery: set all in_progress rows back to pending."""
     conn = get_connection()
